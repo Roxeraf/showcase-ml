@@ -1,23 +1,32 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import openai
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta, date
+import io
 
 # Set up OpenAI API
 openai.api_key = st.secrets["OPENAI_API_KEY"]
 
+# Initialize session state variables
+if 'model_trained' not in st.session_state:
+    st.session_state.model_trained = False
+if 'feature_importance' not in st.session_state:
+    st.session_state.feature_importance = None
+if 'scores' not in st.session_state:
+    st.session_state.scores = None
+
 # Load data
 @st.cache_data
 def load_data():
-    quality_data = pd.read_excel("PS1 SERKEM 036 PP53 komplett – Kopie – Kopie.xlsx")
-    weather_data = pd.read_csv("DecTod_Hum.csv")
-    return quality_data, weather_data
+    data = pd.read_csv("Manufacturing_Data.csv")
+    return data
 
 # Get LLM guidance
 def get_llm_guidance(prompt):
@@ -25,134 +34,127 @@ def get_llm_guidance(prompt):
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant highlighting positive aspects of data analysis."},
+                {"role": "system", "content": "You are a helpful assistant guiding users through data analysis."},
                 {"role": "user", "content": prompt}
             ]
         )
         return response.choices[0].message['content']
     except Exception as e:
-        return f"An error occurred with the OpenAI API: {str(e)}"
+        return f"An error occurred: {str(e)}"
 
 # Function to train the model
 def train_model(X, y):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
+
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
     model = RandomForestRegressor(n_estimators=100, random_state=42)
     model.fit(X_train, y_train)
     score = model.score(X_test, y_test)
+
     return model, scaler, score
 
 # Streamlit app
-st.title('Manufacturing Process Analysis Showcase')
+st.title('Manufacturing Process Analysis')
 
 # Load data
-quality_data, weather_data = load_data()
+data = load_data()
 
-# Preprocess data
-quality_data['DateTime'] = pd.to_datetime(quality_data['Angelegt am'].astype(str) + ' ' + quality_data['Uhrzeit'].astype(str), errors='coerce')
-weather_data['DateTime'] = pd.to_datetime(weather_data['dtVar01_pddb_rxxs'])
+# Display first few rows of the data
+st.write("First few rows of data:")
+st.write(data.head())
 
-# Merge data on nearest timestamp
-merged_data = pd.merge_asof(weather_data.sort_values('DateTime'), 
-                            quality_data.sort_values('DateTime'), 
-                            on='DateTime', 
-                            direction='nearest')
+# Displaying DataFrame info in a text format to avoid BrokenPipeError
+buffer = io.StringIO()
+data.info(buf=buffer)
+s = buffer.getvalue()
+st.text(s)
 
-st.write("Data preprocessing completed.")
-st.write(f"Merged data shape: {merged_data.shape}")
+# Time frame selection
+st.sidebar.header('Time Frame Selection')
+date_column = st.sidebar.selectbox('Select the date column', data.columns)
 
-# Select variables for analysis
-st.sidebar.header('Variable Selection')
-numeric_columns = merged_data.select_dtypes(include=[np.number]).columns.tolist()
-selected_vars = st.sidebar.multiselect('Select variables for analysis', numeric_columns, default=numeric_columns[:5])
+if date_column:
+    data[date_column] = pd.to_datetime(data[date_column])
+    start_date = st.sidebar.date_input('Start Date', data[date_column].min().date())
+    end_date = st.sidebar.date_input('End Date', data[date_column].max().date())
 
-# Humidity range selection
-st.sidebar.header('Ideal Humidity Range')
-humidity_col = st.sidebar.selectbox('Select humidity column', [col for col in numeric_columns if 'hum' in col.lower()])
-ideal_humidity_min = st.sidebar.slider('Minimum Ideal Humidity (%)', 0, 100, 40)
-ideal_humidity_max = st.sidebar.slider('Maximum Ideal Humidity (%)', 0, 100, 60)
+    # Filter data based on selected time frame
+    data = data[(data[date_column].dt.date >= start_date) & 
+                (data[date_column].dt.date <= end_date)]
 
-if selected_vars and humidity_col:
-    # Correlation analysis
-    corr_matrix = merged_data[selected_vars].corr()
-    
-    # Find the highest positive correlations for display
-    high_corr_display = corr_matrix.unstack().sort_values(kind="quicksort", ascending=False).drop_duplicates()
-    high_corr_display = high_corr_display[(high_corr_display < 1.0) & (high_corr_display > 0)].nlargest(10)
-    
-    st.header("Top Positive Correlations (For Display)")
-    for idx, value in high_corr_display.items():
-        st.write(f"{idx[0]} vs {idx[1]}: {value:.2f}")
-    
-    # Heatmap of correlations (showing only positive correlations)
-    fig = px.imshow(corr_matrix.clip(lower=0), text_auto=True, aspect="auto", title="Correlation Heatmap (Positive Only)")
-    st.plotly_chart(fig)
-    
-    # Scatter plots for top positive correlations
-    st.header("Scatter Plots for Top Positive Correlations")
-    for idx, value in high_corr_display.items():
-        fig = px.scatter(merged_data, x=idx[0], y=idx[1], trendline="ols",
-                         title=f"{idx[0]} vs {idx[1]} (Correlation: {value:.2f})")
-        if humidity_col in [idx[0], idx[1]]:
-            hum_axis = 'x' if idx[0] == humidity_col else 'y'
-            fig.add_vrect(x0=ideal_humidity_min, x1=ideal_humidity_max, 
-                          fillcolor="LightGreen", opacity=0.3, layer="below", line_width=0) if hum_axis == 'x' else \
-            fig.add_hrect(y0=ideal_humidity_min, y1=ideal_humidity_max, 
-                          fillcolor="LightGreen", opacity=0.3, layer="below", line_width=0)
-        fig.update_layout(width=800, height=500)
+# Select features and targets
+st.sidebar.header('Feature and Target Selection')
+feature_cols = st.sidebar.multiselect('Select features', data.columns)
+target_cols = st.sidebar.multiselect('Select target variables (up to 6)', data.columns, max_selections=6)
+
+# Process Data button
+if st.sidebar.button('Process Data'):
+    if feature_cols and target_cols:
+        X = data[feature_cols]
+        Y = data[target_cols]
+
+        st.session_state.models = []
+        st.session_state.scalers = []
+        st.session_state.scores = []
+        st.session_state.feature_importance = pd.DataFrame()
+
+        for target in target_cols:
+            model, scaler, score = train_model(X, Y[target])
+            st.session_state.models.append(model)
+            st.session_state.scalers.append(scaler)
+            st.session_state.scores.append(score)
+
+            # Feature importance
+            importance = model.feature_importances_
+            temp_df = pd.DataFrame({'feature': feature_cols, f'importance_{target}': importance})
+            if st.session_state.feature_importance.empty:
+                st.session_state.feature_importance = temp_df
+            else:
+                st.session_state.feature_importance = st.session_state.feature_importance.merge(temp_df, on='feature')
+
+        st.session_state.feature_importance['average_importance'] = st.session_state.feature_importance.filter(like='importance_').mean(axis=1)
+        st.session_state.feature_importance = st.session_state.feature_importance.sort_values('average_importance', ascending=False)
+
+        # Display results
+        for target, score in zip(target_cols, st.session_state.scores):
+            st.write(f"Model R² Score for {target}: {score:.2f}")
+
+        fig = px.bar(st.session_state.feature_importance, x='feature', y='average_importance', title='Average Feature Importance')
         st.plotly_chart(fig)
-    
-    # Time series plot
-    st.header("Time Series Analysis")
-    fig = go.Figure()
-    for var in selected_vars:
-        fig.add_trace(go.Scatter(x=merged_data['DateTime'], y=merged_data[var], name=var))
-    fig.add_hrect(y0=ideal_humidity_min, y1=ideal_humidity_max, 
-                  fillcolor="LightGreen", opacity=0.3, layer="below", line_width=0)
-    fig.update_layout(title="Selected Variables Over Time", xaxis_title="Date", yaxis_title="Value", width=800, height=500)
-    st.plotly_chart(fig)
-    
-    # Train model using all correlations (positive and negative)
-    st.header("Model Training Results")
-    X = merged_data[selected_vars]
-    y = merged_data[humidity_col]
-    model, scaler, score = train_model(X, y)
-    st.write(f"Model R² Score: {score:.2f}")
-    
-    # Feature importance
-    importance = model.feature_importances_
-    feat_importance = pd.DataFrame({'feature': selected_vars, 'importance': importance})
-    feat_importance = feat_importance.sort_values('importance', ascending=False)
-    fig = px.bar(feat_importance, x='feature', y='importance', title='Feature Importance')
-    st.plotly_chart(fig)
-    
-    # LLM explanation
-    st.header("AI-Generated Analysis Summary")
-    prompt = f"""
-    Provide a positive and optimistic summary of the data analysis results, highlighting the following points:
-    1. The strongest positive correlations found: {', '.join([f"{idx[0]} and {idx[1]}" for idx in high_corr_display.index[:3]])}
-    2. The potential implications of these correlations for the manufacturing process.
-    3. How maintaining humidity between {ideal_humidity_min}% and {ideal_humidity_max}% could improve the process.
-    4. The top important features according to the model: {', '.join(feat_importance['feature'].head().tolist())}
-    5. Suggestions for future areas of focus based on these results.
 
-    Keep the tone confident and emphasize the value of these insights for decision-making.
-    """
-    explanation = get_llm_guidance(prompt)
-    st.write(explanation)
+        # Time series plots
+        for target in target_cols:
+            fig = make_subplots(specs=[[{"secondary_y": True}]])
+            fig.add_trace(go.Scatter(x=data[date_column], y=data[target], name=target))
+            for feature in feature_cols:
+                fig.add_trace(go.Scatter(x=data[date_column], y=data[feature], name=feature, visible='legendonly'))
+            fig.update_layout(title=f'{target} and Selected Features Over Time')
+            st.plotly_chart(fig)
 
-else:
-    st.write("Please select variables for analysis and specify the humidity column.")
+        st.session_state.model_trained = True
+    else:
+        st.write("Please select features and at least one target variable to begin the analysis.")
 
-# Closing statement
-st.markdown("""
----
-### Conclusion
-
-This analysis showcases the power of data-driven insights in our manufacturing process. 
-By leveraging advanced analytics, we've uncovered key relationships that can drive 
-significant improvements in efficiency and quality. The identified ideal humidity range 
-provides a clear target for process optimization. These findings provide a strong 
-foundation for strategic decision-making and continuous improvement initiatives.
-""")
+# LLM explanation
+if st.session_state.model_trained:
+    st.header("Ask for Explanation")
+    user_question = st.text_input("What would you like to know about the analysis?")
+    if user_question:
+        try:
+            prompt = f"""
+            The machine learning model analyzed manufacturing process data with the following results:
+            - Target variables: {', '.join(target_cols)}
+            - Features used: {', '.join(feature_cols)}
+            - Model R² Scores: {', '.join([f"{target}: {score:.2f}" for target, score in zip(target_cols, st.session_state.scores)])}
+            - Top important features: {', '.join(st.session_state.feature_importance['feature'].head().tolist())}
+            
+            User question: {user_question}
+            
+            Please provide a clear and concise explanation.
+            """
+            explanation = get_llm_guidance(prompt)
+            st.write(explanation)
+        except Exception as e:
+            st.error(f"An error occurred while getting the explanation: {str(e)}")
+            st.write("Please try asking your question again.")
